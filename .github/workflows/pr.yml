@@ -5,7 +5,7 @@ on:
     branches: [ main ]
 
 env:
-  GO_VERSION: 1.16.x
+  GO_VERSION: 1.17.x
 
 jobs:
 
@@ -37,9 +37,9 @@ jobs:
         export PATH=$PATH:$GOPATH/bin
         make install-tools
         kind create cluster --image kindest/node:v1.21.1
-        kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/latest/download/cert-manager.crds.yaml
+        kubectl create --validate=false -f https://github.com/jetstack/cert-manager/releases/latest/download/cert-manager.crds.yaml
         # Create CRD PodMonitor without running Prometheus operator
-        curl https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/master/bundle.yaml | sed "s/replicas: 1$/replicas: 0/" | kubectl apply -f -
+        curl https://raw.githubusercontent.com/prometheus-operator/prometheus-operator/master/bundle.yaml | sed "s/replicas: 1$/replicas: 0/" | kubectl create -f -
         make install
         sleep 3 # otherwise we sporadically observe 'no matches for kind "RabbitmqCluster" in version "rabbitmq.com/v1beta1'
         find docs/examples/ -name "*.y*ml" -exec kubectl apply --dry-run=server -f {} \;
@@ -99,6 +99,4 @@ jobs:
         export PATH=$PATH:$GOPATH/bin
         make install-tools
         kind create cluster --image kindest/node:"$K8S_VERSION"
-        DOCKER_REGISTRY_SERVER=local-server OPERATOR_IMAGE=local-operator make deploy-kind
-        PATH=$PATH:$(pwd)/bin
-        kubectl-rabbitmq.bats
+        DOCKER_REGISTRY_SERVER=local-server OPERATOR_IMAGE=local-operator make deploy-kind kubectl-plugin-tests

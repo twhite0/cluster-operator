@@ -62,21 +62,42 @@ var _ = Describe("RabbitmqClusterController", func() {
 		AfterEach(func() {
 			Expect(client.Delete(ctx, cluster)).To(Succeed())
 			Eventually(func() bool {
-				rmq := &rabbitmqv1beta1.RabbitmqCluster{}
-				err := client.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, rmq)
+				err := client.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, cluster)
 				return apierrors.IsNotFound(err)
 			}, 5).Should(BeTrue())
 		})
 
 		It("works", func() {
+			By("populating the image spec with the default image", func() {
+				fetchedCluster := &rabbitmqv1beta1.RabbitmqCluster{}
+				Expect(client.Get(ctx, types.NamespacedName{Name: "rabbitmq-one", Namespace: defaultNamespace}, fetchedCluster)).To(Succeed())
+				Expect(fetchedCluster.Spec.Image).To(Equal(defaultRabbitmqImage))
+			})
+
+			var sts *appsv1.StatefulSet
 			By("creating a statefulset with default configurations", func() {
-				sts := statefulSet(ctx, cluster)
+				sts = statefulSet(ctx, cluster)
 
 				Expect(sts.Name).To(Equal(cluster.ChildResourceName("server")))
-				Expect(sts.Spec.Template.Spec.ImagePullSecrets).To(BeEmpty())
 
 				Expect(len(sts.Spec.VolumeClaimTemplates)).To(Equal(1))
 				Expect(sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName).To(BeNil())
+			})
+
+			By("setting the default imagePullSecrets", func() {
+				Expect(sts.Spec.Template.Spec.ImagePullSecrets).To(ConsistOf(
+					[]corev1.LocalObjectReference{
+						{
+							Name: "image-secret-1",
+						},
+						{
+							Name: "image-secret-2",
+						},
+						{
+							Name: "image-secret-3",
+						},
+					},
+				))
 			})
 
 			By("creating the server conf configmap", func() {
@@ -189,6 +210,44 @@ var _ = Describe("RabbitmqClusterController", func() {
 			Expect(sts.Annotations).Should(HaveKeyWithValue("my-annotation", "this-annotation"))
 		})
 
+	})
+
+	Context("Vault is enabled for DefaultUser", func() {
+		BeforeEach(func() {
+			cluster = &rabbitmqv1beta1.RabbitmqCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "rabbitmq-vault",
+					Namespace: defaultNamespace,
+				},
+				Spec: rabbitmqv1beta1.RabbitmqClusterSpec{
+					SecretBackend: rabbitmqv1beta1.SecretBackend{
+						Vault: &rabbitmqv1beta1.VaultSpec{
+							Role:            "some-role",
+							DefaultUserPath: "some-path",
+						},
+					},
+				},
+			}
+
+			Expect(client.Create(ctx, cluster)).To(Succeed())
+			waitForClusterCreation(ctx, cluster, client)
+		})
+
+		AfterEach(func() {
+			Expect(client.Delete(ctx, cluster)).To(Succeed())
+		})
+
+		It("applies the Vault configuration", func() {
+			By("not exposing DefaultUser or its Binding as status")
+			Expect(cluster).NotTo(BeNil())
+			Expect(cluster.Status).NotTo(BeNil())
+			Expect(cluster.Status.DefaultUser).To(BeNil())
+			Expect(cluster.Status.Binding).To(BeNil())
+			By("setting the default user updater image to the controller default")
+			fetchedCluster := &rabbitmqv1beta1.RabbitmqCluster{}
+			Expect(client.Get(ctx, types.NamespacedName{Name: "rabbitmq-vault", Namespace: defaultNamespace}, fetchedCluster)).To(Succeed())
+			Expect(fetchedCluster.Spec.SecretBackend.Vault.DefaultUserUpdaterImage).To(PointTo(Equal(defaultUserUpdaterImage)))
+		})
 	})
 
 	Context("ImagePullSecret configure on the instance", func() {
@@ -378,8 +437,9 @@ var _ = Describe("RabbitmqClusterController", func() {
 			}, 3).Should(HaveKeyWithValue("test-key", "test-value"))
 
 			// verify that SuccessfulUpdate event is recorded for the service
-			Expect(aggregateEventMsgs(ctx, cluster, "SuccessfulUpdate")).To(
-				ContainSubstring("updated resource %s of Type *v1.Service", cluster.ChildResourceName("")))
+			Eventually(func() string {
+				return aggregateEventMsgs(ctx, cluster, "SuccessfulUpdate")
+			}, 5).Should(ContainSubstring("updated resource %s of Type *v1.Service", cluster.ChildResourceName("")))
 		})
 
 		It("the CPU and memory requirements are updated", func() {
@@ -862,19 +922,6 @@ var _ = Describe("RabbitmqClusterController", func() {
 						Projected: &corev1.ProjectedVolumeSource{
 							Sources: []corev1.VolumeProjection{
 								{
-									Secret: &corev1.SecretProjection{
-										LocalObjectReference: corev1.LocalObjectReference{
-											Name: "rabbitmq-sts-override-default-user",
-										},
-										Items: []corev1.KeyToPath{
-											{
-												Key:  "default_user.conf",
-												Path: "default_user.conf",
-											},
-										},
-									},
-								},
-								{
 									ConfigMap: &corev1.ConfigMapProjection{
 										LocalObjectReference: corev1.LocalObjectReference{
 											Name: "rabbitmq-sts-override-server-conf",
@@ -887,6 +934,19 @@ var _ = Describe("RabbitmqClusterController", func() {
 											{
 												Key:  "userDefinedConfiguration.conf",
 												Path: "userDefinedConfiguration.conf",
+											},
+										},
+									},
+								},
+								{
+									Secret: &corev1.SecretProjection{
+										LocalObjectReference: corev1.LocalObjectReference{
+											Name: "rabbitmq-sts-override-default-user",
+										},
+										Items: []corev1.KeyToPath{
+											{
+												Key:  "default_user.conf",
+												Path: "default_user.conf",
 											},
 										},
 									},
@@ -1048,22 +1108,25 @@ var _ = Describe("RabbitmqClusterController", func() {
 			Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
 			Expect(svc.Spec.Ports).To(ConsistOf(
 				corev1.ServicePort{
-					Name:       "amqp",
-					Port:       5672,
-					Protocol:   corev1.ProtocolTCP,
-					TargetPort: amqpTargetPort,
+					Name:        "amqp",
+					Port:        5672,
+					Protocol:    corev1.ProtocolTCP,
+					TargetPort:  amqpTargetPort,
+					AppProtocol: pointer.String("amqp"),
 				},
 				corev1.ServicePort{
-					Name:       "management",
-					Port:       15672,
-					Protocol:   corev1.ProtocolTCP,
-					TargetPort: managementTargetPort,
+					Name:        "management",
+					Port:        15672,
+					Protocol:    corev1.ProtocolTCP,
+					TargetPort:  managementTargetPort,
+					AppProtocol: pointer.String("http"),
 				},
 				corev1.ServicePort{
-					Name:       "prometheus",
-					Port:       15692,
-					Protocol:   corev1.ProtocolTCP,
-					TargetPort: prometheusTargetPort,
+					Name:        "prometheus",
+					Port:        15692,
+					Protocol:    corev1.ProtocolTCP,
+					TargetPort:  prometheusTargetPort,
+					AppProtocol: pointer.String("prometheus.io/metrics"),
 				},
 				corev1.ServicePort{
 					Protocol:   corev1.ProtocolTCP,

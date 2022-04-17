@@ -13,6 +13,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -57,12 +58,15 @@ const (
 // RabbitmqClusterReconciler reconciles a RabbitmqCluster object
 type RabbitmqClusterReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	Namespace     string
-	Recorder      record.EventRecorder
-	ClusterConfig *rest.Config
-	Clientset     *kubernetes.Clientset
-	PodExecutor   PodExecutor
+	Scheme                  *runtime.Scheme
+	Namespace               string
+	Recorder                record.EventRecorder
+	ClusterConfig           *rest.Config
+	Clientset               *kubernetes.Clientset
+	PodExecutor             PodExecutor
+	DefaultRabbitmqImage    string
+	DefaultUserUpdaterImage string
+	DefaultImagePullSecrets string
 }
 
 // the rbac rule requires an empty row at the end to render
@@ -113,6 +117,51 @@ func (r *RabbitmqClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, nil
 	}
 
+	if rabbitmqCluster.Spec.Image == "" {
+		rabbitmqCluster.Spec.Image = r.DefaultRabbitmqImage
+		if err = r.Update(ctx, rabbitmqCluster); err != nil {
+			if k8serrors.IsConflict(err) {
+				logger.Info("failed to update image because of conflict; requeueing...",
+					"namespace", rabbitmqCluster.Namespace,
+					"name", rabbitmqCluster.Name)
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			return ctrl.Result{}, err
+		}
+	}
+
+	if rabbitmqCluster.Spec.ImagePullSecrets == nil {
+		// split the comma separated list of default image pull secrets from
+		// the 'DEFAULT_IMAGE_PULL_SECRETS' env var, but ignore empty strings.
+		for _, reference := range strings.Split(r.DefaultImagePullSecrets, ",") {
+			if len(reference) > 0 {
+				rabbitmqCluster.Spec.ImagePullSecrets = append(rabbitmqCluster.Spec.ImagePullSecrets, corev1.LocalObjectReference{Name: reference})
+			}
+		}
+		if err = r.Update(ctx, rabbitmqCluster); err != nil {
+			if k8serrors.IsConflict(err) {
+				logger.Info("failed to update image pull secrets because of conflict; requeueing...",
+					"namespace", rabbitmqCluster.Namespace,
+					"name", rabbitmqCluster.Name)
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			return ctrl.Result{}, err
+		}
+	}
+
+	if rabbitmqCluster.UsesDefaultUserUpdaterImage() {
+		rabbitmqCluster.Spec.SecretBackend.Vault.DefaultUserUpdaterImage = &r.DefaultUserUpdaterImage
+		if err = r.Update(ctx, rabbitmqCluster); err != nil {
+			if k8serrors.IsConflict(err) {
+				logger.Info("failed to update image because of conflict; requeueing...",
+					"namespace", rabbitmqCluster.Namespace,
+					"name", rabbitmqCluster.Name)
+				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			return ctrl.Result{}, err
+		}
+	}
+
 	// Ensure the resource have a deletion marker
 	if err := r.addFinalizerIfNeeded(ctx, rabbitmqCluster); err != nil {
 		return ctrl.Result{}, err
@@ -122,8 +171,11 @@ func (r *RabbitmqClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{RequeueAfter: requeueAfter}, err
 	}
 
-	if err := r.reconcileTLS(ctx, rabbitmqCluster); err != nil {
-		return ctrl.Result{}, err
+	tlsErr := r.reconcileTLS(ctx, rabbitmqCluster)
+	if errors.Is(tlsErr, disableNonTLSConfigErr) {
+		return ctrl.Result{}, nil
+	} else if tlsErr != nil {
+		return ctrl.Result{}, tlsErr
 	}
 
 	sts, err := r.statefulSet(ctx, rabbitmqCluster)
@@ -150,10 +202,7 @@ func (r *RabbitmqClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		Scheme:   r.Scheme,
 	}
 
-	builders, err := resourceBuilder.ResourceBuilders()
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	builders := resourceBuilder.ResourceBuilders()
 
 	for _, builder := range builders {
 		resource, err := builder.Build()
@@ -170,20 +219,22 @@ func (r *RabbitmqClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 				return ctrl.Result{}, err
 			}
 
-			// only checks for PVC expansion and scale down if statefulSet is created
+			// only checks for scale down if statefulSet is created
 			// else continue to CreateOrUpdate()
 			if !k8serrors.IsNotFound(err) {
 				if err := builder.Update(sts); err != nil {
-					return ctrl.Result{}, err
-				}
-				if err = r.reconcilePVC(ctx, rabbitmqCluster, current, sts); err != nil {
-					r.setReconcileSuccess(ctx, rabbitmqCluster, corev1.ConditionFalse, "FailedReconcilePVC", err.Error())
 					return ctrl.Result{}, err
 				}
 				if r.scaleDown(ctx, rabbitmqCluster, current, sts) {
 					// return when cluster scale down detected; unsupported operation
 					return ctrl.Result{}, nil
 				}
+			}
+
+			// The PVCs for the StatefulSet may require expanding
+			if err = r.reconcilePVC(ctx, rabbitmqCluster, sts); err != nil {
+				r.setReconcileSuccess(ctx, rabbitmqCluster, corev1.ConditionFalse, "FailedReconcilePVC", err.Error())
+				return ctrl.Result{}, err
 			}
 		}
 
@@ -210,11 +261,13 @@ func (r *RabbitmqClusterReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{RequeueAfter: requeueAfter}, err
 	}
 
-	if err := r.setDefaultUserStatus(ctx, rabbitmqCluster); err != nil {
-		return ctrl.Result{}, err
-	}
-	if err := r.setBinding(ctx, rabbitmqCluster); err != nil {
-		return ctrl.Result{}, err
+	if !rabbitmqCluster.VaultDefaultUserSecretEnabled() {
+		if err := r.setDefaultUserStatus(ctx, rabbitmqCluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.setBinding(ctx, rabbitmqCluster); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// By this point the StatefulSet may have finished deploying. Run any

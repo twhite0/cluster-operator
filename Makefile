@@ -25,10 +25,8 @@ unit-tests: install-tools $(KUBEBUILDER_ASSETS) generate fmt vet manifests ## Ru
 integration-tests: install-tools $(KUBEBUILDER_ASSETS) generate fmt vet manifests ## Run integration tests
 	ginkgo -r controllers/
 
-CRD_OPTIONS ?= "crd:trivialVersions=true, preserveUnknownFields=false"
-
 manifests: install-tools ## Generate manifests e.g. CRD, RBAC etc.
-	controller-gen $(CRD_OPTIONS) rbac:roleName=operator-role paths="./api/...;./controllers/..." output:crd:artifacts:config=config/crd/bases
+	controller-gen crd rbac:roleName=operator-role paths="./api/...;./controllers/..." output:crd:artifacts:config=config/crd/bases
 	./hack/remove-override-descriptions.sh
 	./hack/add-notice-to-yaml.sh config/rbac/role.yaml
 	./hack/add-notice-to-yaml.sh config/crd/bases/rabbitmq.com_rabbitmqclusters.yaml
@@ -79,12 +77,12 @@ destroy: ## Cleanup all controller artefacts
 run: generate manifests fmt vet install deploy-namespace-rbac just-run ## Run operator binary locally against the configured Kubernetes cluster in ~/.kube/config
 
 just-run: ## Just runs 'go run main.go' without regenerating any manifests or deploying RBACs
-	KUBE_CONFIG=${HOME}/.kube/config OPERATOR_NAMESPACE=rabbitmq-system go run ./main.go -metrics-bind-address 127.0.0.1:9782
+	KUBECONFIG=${HOME}/.kube/config OPERATOR_NAMESPACE=rabbitmq-system go run ./main.go -metrics-bind-address 127.0.0.1:9782 --zap-devel $(OPERATOR_ARGS)
 
 delve: generate install deploy-namespace-rbac just-delve ## Deploys CRD, Namespace, RBACs and starts Delve debugger
 
 just-delve: install-tools ## Just starts Delve debugger
-	KUBE_CONFIG=${HOME}/.kube/config OPERATOR_NAMESPACE=rabbitmq-system dlv debug
+	KUBECONFIG=${HOME}/.kube/config OPERATOR_NAMESPACE=rabbitmq-system dlv debug
 
 # Install CRDs into a cluster
 install: manifests
@@ -104,10 +102,12 @@ deploy-kind: check-env-docker-repo git-commit-sha manifests deploy-namespace-rba
 	kustomize build config/crd | kubectl apply -f -
 	kustomize build config/default/overlays/kind | sed 's@((operator_docker_image))@"$(DOCKER_REGISTRY_SERVER)/$(OPERATOR_IMAGE):$(GIT_COMMIT)"@' | kubectl apply -f -
 
+QUAY_IO_OPERATOR_IMAGE ?= quay.io/rabbitmqoperator/cluster-operator:latest
 # Builds a single-file installation manifest to deploy the Operator
 generate-installation-manifest:
 	mkdir -p releases
 	kustomize build config/installation/ > releases/rabbitmq-cluster-operator.yaml
+	ytt -f releases/rabbitmq-cluster-operator.yaml -f config/ytt/overlay-manager-image.yaml --data-value operator_image=$(QUAY_IO_OPERATOR_IMAGE) > releases/rabbitmq-cluster-operator-quay-io.yaml
 
 # Build the docker image
 docker-build: check-env-docker-repo git-commit-sha
@@ -165,7 +165,7 @@ system-tests: install-tools ## Run end-to-end tests against Kubernetes cluster d
 
 kubectl-plugin-tests: ## Run kubectl-rabbitmq tests
 	echo "running kubectl plugin tests"
-	./bin/kubectl-rabbitmq.bats
+	PATH=$(PWD)/bin:$$PATH ./bin/kubectl-rabbitmq.bats
 
 tests: unit-tests integration-tests system-tests kubectl-plugin-tests
 

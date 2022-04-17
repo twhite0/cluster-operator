@@ -11,17 +11,16 @@ package main
 import (
 	"flag"
 	"fmt"
+	"k8s.io/klog/v2"
 	"os"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"strconv"
 	"time"
-
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 
 	rabbitmqv1beta1 "github.com/rabbitmq/cluster-operator/api/v1beta1"
 	"github.com/rabbitmq/cluster-operator/controllers"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	defaultscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -43,7 +42,13 @@ func init() {
 }
 
 func main() {
-	var metricsAddr string
+	var (
+		metricsAddr             string
+		defaultRabbitmqImage    = "rabbitmq:3.9.13-management"
+		defaultUserUpdaterImage = "rabbitmqoperator/default-user-credential-updater:1.0.2"
+		defaultImagePullSecrets = ""
+	)
+
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9782", "The address the metric endpoint binds to.")
 
 	opts := zap.Options{}
@@ -51,7 +56,10 @@ func main() {
 
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	logger := zap.New(zap.UseFlagOptions(&opts))
+	ctrl.SetLogger(logger)
+	// https://github.com/kubernetes-sigs/controller-runtime/issues/1420#issuecomment-794525248
+	klog.SetLogger(logger.WithName("rabbitmq-cluster-operator"))
 
 	operatorNamespace := os.Getenv("OPERATOR_NAMESPACE")
 	if operatorNamespace == "" {
@@ -61,6 +69,18 @@ func main() {
 
 	// If the environment variable is not set Getenv returns an empty string which ctrl.Options.Namespace takes to mean all namespaces should be watched
 	operatorScopeNamespace := os.Getenv("OPERATOR_SCOPE_NAMESPACE")
+
+	if configuredDefaultRabbitmqImage, ok := os.LookupEnv("DEFAULT_RABBITMQ_IMAGE"); ok {
+		defaultRabbitmqImage = configuredDefaultRabbitmqImage
+	}
+
+	if configuredDefaultUserUpdaterImage, ok := os.LookupEnv("DEFAULT_USER_UPDATER_IMAGE"); ok {
+		defaultUserUpdaterImage = configuredDefaultUserUpdaterImage
+	}
+
+	if configuredDefaultImagePullSecrets, ok := os.LookupEnv("DEFAULT_IMAGE_PULL_SECRETS"); ok {
+		defaultImagePullSecrets = configuredDefaultImagePullSecrets
+	}
 
 	options := ctrl.Options{
 		Scheme:                  scheme,
@@ -92,26 +112,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	var clusterConfig *rest.Config
-	if kubeConfigPath := os.Getenv("KUBE_CONFIG"); kubeConfigPath != "" {
-		clusterConfig, err = clientcmd.BuildConfigFromFlags("", kubeConfigPath)
-	} else {
-		clusterConfig, err = rest.InClusterConfig()
-	}
-
-	if err != nil {
-		log.Error(err, "unable to get kubernetes cluster config")
-		os.Exit(1)
-	}
+	clusterConfig := config.GetConfigOrDie()
 
 	err = (&controllers.RabbitmqClusterReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		Recorder:      mgr.GetEventRecorderFor(controllerName),
-		Namespace:     operatorNamespace,
-		ClusterConfig: clusterConfig,
-		Clientset:     kubernetes.NewForConfigOrDie(clusterConfig),
-		PodExecutor:   controllers.NewPodExecutor(),
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Recorder:                mgr.GetEventRecorderFor(controllerName),
+		Namespace:               operatorNamespace,
+		ClusterConfig:           clusterConfig,
+		Clientset:               kubernetes.NewForConfigOrDie(clusterConfig),
+		PodExecutor:             controllers.NewPodExecutor(),
+		DefaultRabbitmqImage:    defaultRabbitmqImage,
+		DefaultUserUpdaterImage: defaultUserUpdaterImage,
+		DefaultImagePullSecrets: defaultImagePullSecrets,
 	}).SetupWithManager(mgr)
 	if err != nil {
 		log.Error(err, "unable to create controller", controllerName)

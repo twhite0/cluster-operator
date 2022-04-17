@@ -170,15 +170,14 @@ eventually() {
 
   eventually "kubectl exec bats-default-server-0 -- rabbitmqctl list_connections client_properties | grep perf-test " 600
 
-  kubectl delete pod -l "app=perf-test,run=perf-test"
-  kubectl delete svc -l "app=perf-test,run=perf-test"
+  kubectl delete job -l "app=perf-test"
 }
 
 @test "debug sets log level to debug" {
   kubectl rabbitmq debug bats-default
 
   # '[debug] <pid> Lager installed handler' is logged even without enabling debug logging
-  eventually "kubectl logs bats-default-server-0 | grep -v ' \[debug\] .* Lager installed handler ' | grep ' \[debug\] '" 30
+  eventually "kubectl logs bats-default-server-0 | grep -v ' \[dbug\] .* Lager installed handler ' | grep ' \[dbug\] '" 30
 }
 
 @test "delete deletes RabbitMQ cluster" {
